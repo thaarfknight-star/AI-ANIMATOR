@@ -1,0 +1,79 @@
+name: Build AI Animator
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: AIAnimator-windows
+            build_path: dist/AIAnimator
+          - os: macos-latest
+            artifact_name: AIAnimator-macos
+            build_path: dist/AIAnimator
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Install torch (Windows CPU + DirectML for AMD/Intel GPUs)
+        if: matrix.os == 'windows-latest'
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install torch-directml
+
+      - name: Install torch (macOS, MPS on Apple Silicon)
+        if: matrix.os == 'macos-latest'
+        run: pip install torch
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.build_path }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package artifacts for release
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            zip -r "../${name}.zip" "$dir"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
