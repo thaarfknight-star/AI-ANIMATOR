@@ -5,19 +5,35 @@ Bundles the full on-device AI stack (torch, diffusers, rembg, ...) so the
 app runs with zero installs on the user's PC. Diffusion model weights are
 NOT bundled - they download once into ai_models/ on first AI use.
 """
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 datas = [("assets", "assets")]
 binaries = []
 hiddenimports = []
 
-for pkg in ("torch", "diffusers", "huggingface_hub", "safetensors",
-            "rembg", "onnxruntime", "PIL"):
+# Collect full package content (code + data files) for the whole AI stack.
+for pkg in ("torch", "diffusers", "transformers", "tokenizers",
+            "huggingface_hub", "safetensors", "rembg", "onnxruntime",
+            "PIL", "numpy", "requests", "urllib3", "certifi",
+            "charset_normalizer", "idna", "tqdm", "packaging",
+            "filelock", "fsspec", "regex"):
     try:
         d, b, h = collect_all(pkg)
         datas += d
         binaries += b
         hiddenimports += h
+    except Exception:
+        pass
+
+# Package *metadata* (dist-info): libraries like huggingface_hub/transformers
+# call importlib.metadata at runtime and crash without it ("No package
+# metadata was found for ..."). This was the missing piece.
+for pkg in ("requests", "urllib3", "certifi", "transformers", "tokenizers",
+            "diffusers", "huggingface_hub", "safetensors", "filelock",
+            "fsspec", "tqdm", "packaging", "regex", "numpy", "Pillow",
+            "torch", "onnxruntime", "rembg"):
+    try:
+        datas += copy_metadata(pkg)
     except Exception:
         pass
 

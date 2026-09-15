@@ -5,8 +5,14 @@ PySide6
 numpy
 Pillow
 diffusers==0.31.0
+transformers
+tokenizers
 huggingface_hub
 safetensors
+requests
+urllib3
+certifi
+tqdm
 rembg
 onnxruntime
 pyinstaller
