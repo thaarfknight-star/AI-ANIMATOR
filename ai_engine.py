@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
-"""Complete on-device AI pipeline (3 stages), optimized for real hardware.
+"""Complete on-device AI pipeline (3 stages) + prompt-driven scenarios.
 
 Stage 1 - Avatar generation : Stable Diffusion 1.5 img2img turns the user's
-                            photo into a stylized streamer avatar.
-Stage 2 - Animation keyframes: AI generates 2-3 pose keyframes per scenario;
-                            procedural tweening turns them into 60 frames
-                            (~10x lighter than video-diffusion, runs on iGPU).
+                            photo into a stylized avatar (identity kept).
+Stage 2 - Animation keyframes: AI draws 2+ pose keyframes per scenario from
+                            prompts; procedural tweening turns them into a
+                            smooth 60-frame loop (~10x lighter than
+                            video-diffusion, runs on iGPU via DirectML/MPS).
 Stage 3 - Matting           : light u2netp background removal (CPU friendly).
 
+Scenarios are DATA (scenarios.json next to the app): the user can add new
+ones from any prompt, so the program grows into a general animation tool.
+
 Optimizations: fp16 on CUDA/MPS, 24 steps @512px, models cached in an
-app-local folder (downloaded once on first AI use - no pip installs),
+app-local folder (downloaded once on first AI use - no installs),
 automatic device pick: CUDA > DirectML (AMD/Intel on Windows) > MPS (macOS)
 > CPU. Everything is bundled inside the exe.
 """
+import json
 import os
 import sys
 import threading
@@ -21,10 +26,49 @@ MODEL_ID = "runwayml/stable-diffusion-v1-5"
 STEPS = 24
 GUIDANCE = 7.5
 IMG_SIZE = 512
+SCENARIO_CONFIG_VERSION = 1
+
+AVATAR_PROMPT = (
+    "stylized digital avatar portrait of the same person, friendly streamer "
+    "style, clean vector-like shading, vibrant colors, centered head and "
+    "shoulders, simple gradient background, high quality"
+)
+AVATAR_NEG = "blurry, distorted face, extra limbs, deformed, low quality, watermark"
+
+DEFAULT_SCENARIOS = [
+    {
+        "id": "working",
+        "name_fa": "در حال کار",
+        "strength": 0.55,
+        "prompts": [
+            "the same character typing on a keyboard, focused, side view",
+            "the same character looking at a glowing monitor, front view",
+            "the same character raising one hand with an idea, cheerful",
+        ],
+    },
+    {
+        "id": "waiting",
+        "name_fa": "در انتظار",
+        "strength": 0.55,
+        "prompts": [
+            "the same character standing idle, relaxed pose, arms crossed",
+            "the same character tilting head slightly, patient look",
+        ],
+    },
+    {
+        "id": "create",
+        "name_fa": "ساخت عکس",
+        "strength": 0.55,
+        "prompts": [
+            "the same character painting on a canvas with a brush",
+            "the same character holding up a finished colorful painting, proud",
+        ],
+    },
+]
 
 
 def app_data_dir():
-    """Writable app-local folder for downloaded models (no system installs)."""
+    """Writable app-local folder for models + scenario config (no installs)."""
     base = os.path.dirname(os.path.abspath(__file__))
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
@@ -33,12 +77,43 @@ def app_data_dir():
     return d
 
 
+def scenarios_path():
+    return os.path.join(app_data_dir(), "scenarios.json")
+
+
+def load_scenarios():
+    """Load user scenarios; seed with defaults on first run; merge new ids."""
+    path = scenarios_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            scenarios = data.get("scenarios", [])
+            have = {s["id"] for s in scenarios}
+            # merge in any new built-in scenarios from updates
+            for default in DEFAULT_SCENARIOS:
+                if default["id"] not in have:
+                    scenarios.insert(0, dict(default))
+            return scenarios
+        except Exception:
+            pass
+    scenarios = [dict(s) for s in DEFAULT_SCENARIOS]
+    save_scenarios(scenarios)
+    return scenarios
+
+
+def save_scenarios(scenarios):
+    with open(scenarios_path(), "w", encoding="utf-8") as f:
+        json.dump({"version": SCENARIO_CONFIG_VERSION,
+                   "scenarios": scenarios}, f, ensure_ascii=False, indent=2)
+
+
 class NoTorchError(RuntimeError):
     pass
 
 
 def pick_device():
-    """Return (kind, label_fa). Never imports torch unless needed by caller."""
+    """Return (kind, label_fa). Raises NoTorchError when torch is missing."""
     try:
         import torch
     except ImportError:
@@ -55,30 +130,60 @@ def pick_device():
     return "cpu", "پردازنده (کندتر، ولی کار می‌کند)"
 
 
-# ------------------------------------------------------------------ prompts --
-AVATAR_PROMPT = (
-    "stylized digital avatar portrait of the same person, friendly streamer "
-    "style, clean vector-like shading, vibrant colors, centered head and "
-    "shoulders, simple gradient background, high quality"
-)
-AVATAR_NEG = "blurry, distorted face, extra limbs, deformed, low quality, watermark"
+def check_engine():
+    """Self-test: import every AI component. Returns [(name_fa, ok, detail)].
 
-KEYFRAME_PROMPTS = {
-    # scenario -> list of (prompt, strength)
-    "working": [
-        ("the same character typing on a keyboard, focused, side view", 0.55),
-        ("the same character looking at a glowing monitor, front view", 0.55),
-        ("the same character raising one hand with an idea, cheerful", 0.55),
-    ],
-    "waiting": [
-        ("the same character standing idle, relaxed pose, arms crossed", 0.55),
-        ("the same character tilting head slightly, patient look", 0.55),
-    ],
-    "create": [
-        ("the same character painting on a canvas with a brush", 0.55),
-        ("the same character holding up a finished colorful painting, proud", 0.55),
-    ],
-}
+    Catches packaging bugs (like the diffusers/huggingface_hub import break)
+    before the heavy model download starts.
+    """
+    out = []
+
+    def _ver(mod):
+        return getattr(mod, "__version__", "?")
+
+    try:
+        import torch
+        out.append(("torch", True, _ver(torch)))
+    except Exception as e:  # noqa: BLE001
+        out.append(("torch", False, str(e)[:160]))
+        return out
+    try:
+        import torch_directml  # noqa: F401
+        out.append(("torch-directml", True, _ver(sys.modules["torch_directml"])))
+    except Exception:  # noqa: BLE001
+        out.append(("torch-directml", False, "موجود نیست (فقط ویندوز/اختیاری)"))
+    try:
+        # the exact import that broke on the built exe before pinning
+        from diffusers import StableDiffusionImg2ImgPipeline  # noqa: F401
+        import diffusers
+        out.append(("diffusers", True, _ver(diffusers)))
+    except Exception as e:  # noqa: BLE001
+        out.append(("diffusers", False, str(e)[:200]))
+    try:
+        import transformers
+        out.append(("transformers", True, _ver(transformers)))
+    except Exception as e:  # noqa: BLE001
+        out.append(("transformers", False, str(e)[:160]))
+    try:
+        import huggingface_hub
+        # diffusers<0.31 needs cached_download, removed in huggingface_hub>=0.26
+        ok = hasattr(huggingface_hub, "cached_download")
+        out.append(("huggingface_hub", True,
+                    _ver(huggingface_hub) + (" (cached_download ✅)" if ok else " (cached_download ❌)")))
+    except Exception as e:  # noqa: BLE001
+        out.append(("huggingface_hub", False, str(e)[:160]))
+    try:
+        from rembg import new_session  # noqa: F401
+        import rembg
+        out.append(("rembg", True, _ver(rembg)))
+    except Exception as e:  # noqa: BLE001
+        out.append(("rembg", False, str(e)[:160]))
+    try:
+        kind, label = pick_device()
+        out.append(("دستگاه محاسبه", True, f"{label} [{kind}]"))
+    except Exception as e:  # noqa: BLE001
+        out.append(("دستگاه محاسبه", False, str(e)[:160]))
+    return out
 
 
 class AIEngine:
@@ -166,14 +271,14 @@ class AIEngine:
         self._progress("ساخت آواتار با AI", 100)
         return avatar
 
-    def make_keyframes(self, avatar, scenario):
-        """Stage 2: avatar -> AI pose keyframes (list of PIL RGB)."""
-        prompts = KEYFRAME_PROMPTS[scenario]
+    def make_keyframes(self, avatar, prompts, strength, tag):
+        """Stage 2: avatar + prompts -> AI pose keyframes (list of PIL RGB)."""
         frames = []
-        for idx, (prompt, strength) in enumerate(prompts):
-            self._progress(f"ساخت ژست {idx + 1}/{len(prompts)} ({scenario})",
+        for idx, prompt in enumerate(prompts):
+            self._progress(f"ساخت ژست {idx + 1}/{len(prompts)} ({tag})",
                            int(100 * idx / len(prompts)))
-            frames.append(self._img2img(avatar, prompt, strength, seed=100 + idx))
+            frames.append(self._img2img(avatar, prompt, strength,
+                                        seed=1000 + idx))
         self._progress("ساخت ژست‌ها", 100)
         return frames
 
@@ -193,16 +298,19 @@ class AIEngine:
             return make_sprite(pil_img.convert("RGBA"), 384)
 
     # ------------------------------------------------------------- pipeline --
-    def build_character(self, photo):
-        """Run all 3 stages. Returns dict(avatar_rgba, keyframes={sc: [rgba]})."""
+    def build_character(self, photo, scenarios):
+        """Run all 3 stages. Returns dict(avatar_rgb, avatar_rgba,
+        keyframes={scenario_id: [rgba]})."""
         self._progress("شروع", 0)
         avatar = self.make_avatar(photo)
         self._progress("حذف پس‌زمینه آواتار", 0)
         avatar_rgba = self.remove_background(avatar)
 
         keyframes = {}
-        for sc in ("working", "waiting", "create"):
-            kfs = self.make_keyframes(avatar, sc)
-            keyframes[sc] = [self.remove_background(k) for k in kfs]
+        for sc in scenarios:
+            kfs = self.make_keyframes(avatar, sc["prompts"],
+                                      sc.get("strength", 0.55), sc["name_fa"])
+            keyframes[sc["id"]] = [self.remove_background(k) for k in kfs]
         self._progress("تمام شد ✅", 100)
-        return {"avatar_rgba": avatar_rgba, "keyframes": keyframes}
+        return {"avatar_rgb": avatar, "avatar_rgba": avatar_rgba,
+                "keyframes": keyframes}

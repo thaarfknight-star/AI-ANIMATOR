@@ -6,6 +6,9 @@ Two engines:
   * AI (on-device): 3-stage pipeline - avatar generation -> pose keyframes
     -> background removal. Needs the full build (torch bundled) and downloads
     the diffusion model once on first use. Falls back to procedural on error.
+
+Scenarios are user-extensible: "new scenario from prompt" turns any list of
+prompts into a permanent, re-renderable animation scenario.
 """
 import os
 import sys
@@ -14,7 +17,8 @@ import traceback
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QRadioButton,
     QVBoxLayout, QHBoxLayout, QFileDialog, QButtonGroup, QFrame, QSizePolicy,
-    QProgressBar,
+    QProgressBar, QTextEdit, QDialog, QLineEdit, QPlainTextEdit,
+    QDialogButtonBox,
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap
@@ -22,7 +26,7 @@ from PySide6.QtGui import QImage, QPixmap
 from PIL import Image
 
 from character import load_photo, make_sprite, make_painting
-from scenarios import render_all, render_keyframed, SCENARIO_NAMES_FA, FPS
+from scenarios import render_all, render_keyframed, FPS
 from exporter import export_gif
 
 
@@ -31,7 +35,7 @@ def resource_path(rel):
     return os.path.join(base, rel)
 
 
-ORDER = ["working", "waiting", "create"]
+BUILTIN_IDS = ("working", "waiting", "create")
 
 
 class AIWorker(QThread):
@@ -40,22 +44,91 @@ class AIWorker(QThread):
     done = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, photo):
+    def __init__(self, job, photo, avatar_rgb=None):
         super().__init__()
+        self.job = job            # {"type": "full"} | {"type": "scenario", "scenario": {...}}
         self.photo = photo
+        self.avatar_rgb = avatar_rgb  # reuse avatar across scenario jobs
 
     def run(self):
         try:
-            from ai_engine import AIEngine
+            from ai_engine import AIEngine, load_scenarios
             engine = AIEngine(
                 progress_cb=lambda s, p: self.progress.emit(s, p),
                 log_cb=lambda t: self.log.emit(t),
             )
-            result = engine.build_character(self.photo)
+            if self.job["type"] == "full":
+                result = engine.build_character(self.photo, load_scenarios())
+            else:
+                sc = self.job["scenario"]
+                avatar = self.avatar_rgb
+                avatar_rgba = None
+                if avatar is None:
+                    self.log.emit("ساخت آواتار (برای سناریوی جدید)...")
+                    avatar = engine.make_avatar(self.photo)
+                    avatar_rgba = engine.remove_background(avatar)
+                kfs = engine.make_keyframes(avatar, sc["prompts"],
+                                            sc.get("strength", 0.55),
+                                            sc["name_fa"])
+                kf_rgba = [engine.remove_background(k) for k in kfs]
+                result = {"avatar_rgb": avatar, "avatar_rgba": avatar_rgba,
+                          "keyframes": {sc["id"]: kf_rgba}, "scenario": sc}
             self.done.emit(result)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
-            self.failed.emit(str(e))
+            self.failed.emit(str(e)[:400])
+
+
+class CheckWorker(QThread):
+    finished = Signal(list)
+
+    def run(self):
+        try:
+            from ai_engine import check_engine
+            self.finished.emit(check_engine())
+        except Exception as e:  # noqa: BLE001
+            self.finished.emit([("بررسی", False, str(e)[:200])])
+
+
+class ScenarioDialog(QDialog):
+    """New scenario from prompts: name (Persian) + one English prompt per line."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("سناریوی جدید از پرامپت")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(440, 380)
+        lay = QVBoxLayout(self)
+
+        lay.addWidget(QLabel("نام سناریو (فارسی):"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("مثلاً: در حال بازی")
+        lay.addWidget(self.name_edit)
+
+        lay.addWidget(QLabel("پرامپت‌ها (انگلیسی، هر خط یک ژست):"))
+        self.prompts_edit = QPlainTextEdit()
+        self.prompts_edit.setPlaceholderText(
+            "the same character playing guitar on stage\n"
+            "the same character jumping with joy, confetti")
+        lay.addWidget(self.prompts_edit)
+
+        hint = QLabel("نکته: هر پرامپت با «the same character» شروع شود تا کاراکتر ثابت بماند.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888; font-size:11px;")
+        lay.addWidget(hint)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.button(QDialogButtonBox.Ok).setText("ساخت انیمیشن")
+        box.button(QDialogButtonBox.Cancel).setText("انصراف")
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+
+    def values(self):
+        name = self.name_edit.text().strip()
+        prompts = [l.strip() for l in self.prompts_edit.toPlainText().splitlines()
+                   if l.strip()]
+        return name, prompts
 
 
 class MainWindow(QMainWindow):
@@ -63,17 +136,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("استودیو انیمیشن AI")
         self.setLayoutDirection(Qt.RightToLeft)
-        self.resize(920, 660)
+        self.resize(960, 700)
+
+        from ai_engine import load_scenarios
+        self.scenarios = load_scenarios()
 
         self.photo = None
         self.sprite = None
         self.painting = None
         self.frames = []
         self.frame_idx = 0
-        self.scenario = "working"
-        self.ai_character = None   # dict from AIEngine.build_character
-        self.ai_mode = False
+        self.scenario = self.scenarios[0]["id"]
+        self.ai_keyframes = {}     # scenario_id -> [RGBA]
+        self.ai_avatar_rgb = None  # reused for new scenarios/prompts
         self.worker = None
+        self.check_worker = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -93,7 +170,7 @@ class MainWindow(QMainWindow):
         panel = QFrame()
         panel.setStyleSheet("QFrame { background:#1c1c26; border-radius:12px; }")
         lay = QVBoxLayout(panel)
-        lay.setSpacing(10)
+        lay.setSpacing(8)
         lay.setContentsMargins(18, 18, 18, 18)
 
         title = QLabel("🎬 استودیو انیمیشن AI")
@@ -110,13 +187,20 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lbl_photo)
 
         self.btn_ai = QPushButton("🤖 ساخت آواتار با AI")
-        self.btn_ai.clicked.connect(self.start_ai)
+        self.btn_ai.clicked.connect(self.start_ai_full)
         lay.addWidget(self.btn_ai)
+
+        self.btn_prompt = QPushButton("✨ سناریوی جدید از پرامپت")
+        self.btn_prompt.clicked.connect(self.new_scenario_dialog)
+        lay.addWidget(self.btn_prompt)
+
+        self.btn_check = QPushButton("🔍 بررسی موتور AI")
+        self.btn_check.clicked.connect(self.run_check)
+        lay.addWidget(self.btn_check)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setTextVisible(True)
         self.progress.setStyleSheet(
             "QProgressBar { background:#101018; border-radius:6px; color:#ddd; }"
             "QProgressBar::chunk { background:#0f7cc1; border-radius:6px; }")
@@ -130,18 +214,23 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(QLabel("سناریو:"))
         self.group = QButtonGroup(self)
-        for key in ORDER:
-            rb = QRadioButton(SCENARIO_NAMES_FA[key])
-            rb.setStyleSheet("color:#eee; font-size:15px; padding:6px;")
-            if key == self.scenario:
-                rb.setChecked(True)
-            rb.toggled.connect(lambda on, k=key: on and self.set_scenario(k))
-            self.group.addButton(rb)
-            lay.addWidget(rb)
+        self.radio_box = QVBoxLayout()
+        self.radio_box.setSpacing(2)
+        lay.addLayout(self.radio_box)
+        self.rebuild_radios()
 
         self.btn_export = QPushButton("💾 ذخیره گیف شفاف")
         self.btn_export.clicked.connect(self.save_gif)
         lay.addWidget(self.btn_export)
+
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumHeight(110)
+        self.log_view.setStyleSheet(
+            "QTextEdit { background:#101018; color:#9db4d0; font-size:11px;"
+            " border-radius:6px; }")
+        self.log_view.setPlaceholderText("گزارش موتور AI اینجا نمایش داده می‌شود…")
+        lay.addWidget(self.log_view)
 
         lay.addStretch(1)
         self.status = QLabel("")
@@ -166,6 +255,12 @@ class MainWindow(QMainWindow):
             " padding:10px; font-size:14px; }"
             "QPushButton:hover { background:#9440dd; }"
             "QPushButton:disabled { background:#4a4a55; color:#999; }")
+        for b in (self.btn_prompt, self.btn_check):
+            b.setStyleSheet(
+                "QPushButton { background:#2a2a3a; color:#ddd; border-radius:8px;"
+                " padding:9px; font-size:13px; }"
+                "QPushButton:hover { background:#3a3a4e; }"
+                "QPushButton:disabled { background:#22222c; color:#777; }")
 
         # ---- playback timer ----
         self.timer = QTimer(self)
@@ -175,14 +270,31 @@ class MainWindow(QMainWindow):
         self.load_image(resource_path(os.path.join("assets", "sample.png")),
                         label="عکس نمونه فعال است")
 
+    # ------------------------------------------------------------ scenarios --
+    def rebuild_radios(self):
+        while self.radio_box.count():
+            item = self.radio_box.takeAt(0)
+            w = item.widget()
+            if w:
+                self.group.removeButton(w)
+                w.deleteLater()
+        for sc in self.scenarios:
+            rb = QRadioButton(sc["name_fa"])
+            rb.setStyleSheet("color:#eee; font-size:15px; padding:5px;")
+            if sc["id"] == self.scenario:
+                rb.setChecked(True)
+            rb.toggled.connect(lambda on, k=sc["id"]: on and self.set_scenario(k))
+            self.group.addButton(rb)
+            self.radio_box.addWidget(rb)
+
     # ------------------------------------------------------------
     def choose_photo(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "انتخاب عکس", "",
             "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
         if path:
-            self.ai_character = None
-            self.ai_mode = False
+            self.ai_keyframes = {}
+            self.ai_avatar_rgb = None
             self.load_image(path, label=os.path.basename(path))
 
     def load_image(self, path, label=""):
@@ -202,50 +314,104 @@ class MainWindow(QMainWindow):
         self.scenario = key
         self.render()
 
+    def log(self, text):
+        self.log_view.append(text)
+
     # ------------------------------------------------------------ AI --
-    def start_ai(self):
+    def start_ai_full(self):
         if self.photo is None or self.worker is not None:
             return
-        try:
-            from ai_engine import pick_device  # noqa
-        except Exception as e:  # noqa: BLE001
-            self.status.setText(f"موتور AI در دسترس نیست: {e}")
-            return
-        self.btn_ai.setEnabled(False)
-        self.progress.show()
-        self.progress.setValue(0)
-        self.lbl_stage.setText("در حال شروع...")
-        self.status.setText("AI در حال کار است، لطفاً صبر کنید...")
-        self.worker = AIWorker(self.photo.copy())
-        self.worker.progress.connect(self.on_ai_progress)
-        self.worker.log.connect(self.on_ai_log)
-        self.worker.done.connect(self.on_ai_done)
-        self.worker.failed.connect(self.on_ai_failed)
+        self._busy(True, "AI در حال کار است، لطفاً صبر کنید...")
+        self.worker = AIWorker({"type": "full"}, self.photo.copy())
+        self._wire_worker(self.worker)
         self.worker.start()
+
+    def new_scenario_dialog(self):
+        if self.photo is None or self.worker is not None:
+            return
+        dlg = ScenarioDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        name, prompts = dlg.values()
+        if not name or not prompts:
+            self.status.setText("نام و حداقل یک پرامپت لازم است")
+            return
+        import time
+        from ai_engine import save_scenarios
+        sc = {"id": f"custom_{int(time.time())}", "name_fa": name,
+              "strength": 0.55, "prompts": prompts}
+        self.scenarios.append(sc)
+        save_scenarios(self.scenarios)
+        self.rebuild_radios()
+        self.set_scenario(sc["id"])
+        self._busy(True, f"در حال ساخت سناریوی «{name}»...")
+        self.log(f"✨ سناریوی جدید: {name} ({len(prompts)} ژست)")
+        self.worker = AIWorker({"type": "scenario", "scenario": sc},
+                               self.photo.copy(), self.ai_avatar_rgb)
+        self._wire_worker(self.worker)
+        self.worker.start()
+
+    def run_check(self):
+        if self.check_worker is not None:
+            return
+        self.btn_check.setEnabled(False)
+        self.log("🔍 بررسی موتور AI...")
+        self.check_worker = CheckWorker()
+        self.check_worker.finished.connect(self.on_check_done)
+        self.check_worker.start()
+
+    def on_check_done(self, results):
+        self.check_worker = None
+        self.btn_check.setEnabled(True)
+        for name, ok, detail in results:
+            self.log(("✅ " if ok else "❌ ") + f"{name}: {detail}")
+        bad = [n for n, ok, _ in results if not ok and n != "torch-directml"]
+        if bad:
+            self.status.setText("موتور AI مشکل دارد؛ گزارش بالا را بفرستید")
+        else:
+            self.status.setText("موتور AI سالم است ✅")
+
+    def _busy(self, busy, msg=""):
+        for b in (self.btn_ai, self.btn_prompt, self.btn_check, self.btn_load):
+            b.setEnabled(not busy)
+        if busy:
+            self.progress.show()
+            self.progress.setValue(0)
+            self.lbl_stage.setText("در حال شروع...")
+            self.status.setText(msg)
+        else:
+            self.progress.hide()
+            self.lbl_stage.setText("")
+
+    def _wire_worker(self, worker):
+        worker.progress.connect(self.on_ai_progress)
+        worker.log.connect(self.log)
+        worker.done.connect(self.on_ai_done)
+        worker.failed.connect(self.on_ai_failed)
 
     def on_ai_progress(self, stage, pct):
         self.lbl_stage.setText(stage)
         self.progress.setValue(max(0, min(100, pct)))
 
-    def on_ai_log(self, text):
-        self.status.setText(text)
-
     def on_ai_done(self, result):
         self.worker = None
-        self.ai_character = result
-        self.ai_mode = True
-        self.btn_ai.setEnabled(True)
-        self.progress.hide()
-        self.lbl_stage.setText("")
+        if result.get("avatar_rgb") is not None:
+            self.ai_avatar_rgb = result["avatar_rgb"]
+        for sid, kfs in result["keyframes"].items():
+            self.ai_keyframes[sid] = kfs
+        if result.get("scenario"):
+            self.set_scenario(result["scenario"]["id"])
+        self._busy(False)
         self.status.setText("آواتار AI آماده شد ✅")
+        self.log("تمام شد ✅")
         self.render()
 
     def on_ai_failed(self, err):
         self.worker = None
-        self.btn_ai.setEnabled(True)
-        self.progress.hide()
-        self.lbl_stage.setText("")
-        self.status.setText(f"AI ناموفق بود، حالت نمایشی فعال است:\n{err[:160]}")
+        self._busy(False)
+        self.status.setText("AI ناموفق بود، حالت نمایشی فعال است")
+        self.log(f"❌ خطا: {err}")
+        self.log("💡 با دکمه «بررسی موتور AI» جزئیات را ببینید")
 
     # ------------------------------------------------------------ render --
     def render(self):
@@ -253,16 +419,17 @@ class MainWindow(QMainWindow):
             return
         self.status.setText("در حال ساخت انیمیشن...")
         QApplication.processEvents()
-        if self.ai_mode and self.ai_character:
-            kfs = self.ai_character["keyframes"].get(self.scenario)
-            if kfs:
-                self.frames = render_keyframed(kfs)
-            else:
-                self.frames = render_all(self.sprite, self.painting, self.scenario)
-        else:
+        kfs = self.ai_keyframes.get(self.scenario)
+        if kfs:
+            self.frames = render_keyframed(kfs)
+            mode = "AI 🤖"
+        elif self.scenario in BUILTIN_IDS:
             self.frames = render_all(self.sprite, self.painting, self.scenario)
+            mode = "نمایشی"
+        else:
+            self.frames = render_all(self.sprite, self.painting, "waiting")
+            mode = "نمایشی (اول AI را اجرا کنید)"
         self.frame_idx = 0
-        mode = "AI 🤖" if self.ai_mode else "نمایشی"
         self.status.setText(f"آماده ✅ (حالت {mode})")
 
     def next_frame(self):

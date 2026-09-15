@@ -13,7 +13,8 @@ hiddenimports = []
 
 # Collect full package content (code + data files) for the whole AI stack.
 for pkg in ("torch", "diffusers", "transformers", "tokenizers",
-            "huggingface_hub", "safetensors", "rembg", "onnxruntime",
+            "huggingface_hub", "safetensors", "accelerate", "rembg",
+            "onnxruntime",
             "PIL", "numpy", "requests", "urllib3", "certifi",
             "charset_normalizer", "idna", "tqdm", "packaging",
             "filelock", "fsspec", "regex"):
@@ -29,9 +30,9 @@ for pkg in ("torch", "diffusers", "transformers", "tokenizers",
 # call importlib.metadata at runtime and crash without it ("No package
 # metadata was found for ..."). This was the missing piece.
 for pkg in ("requests", "urllib3", "certifi", "transformers", "tokenizers",
-            "diffusers", "huggingface_hub", "safetensors", "filelock",
-            "fsspec", "tqdm", "packaging", "regex", "numpy", "Pillow",
-            "torch", "onnxruntime", "rembg"):
+            "diffusers", "huggingface_hub", "safetensors", "accelerate",
+            "filelock", "fsspec", "tqdm", "packaging", "regex", "numpy",
+            "Pillow", "torch", "onnxruntime", "rembg"):
     try:
         datas += copy_metadata(pkg)
     except Exception:

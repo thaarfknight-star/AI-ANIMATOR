@@ -1,18 +1,28 @@
-# Full build requirements (CI). torch is installed per-OS in the workflow:
-#  - Windows: CPU wheel + torch-directml (AMD/Intel GPUs via DirectML)
-#  - macOS: default wheel (MPS on Apple Silicon)
+# Full build requirements (CI) - versions pinned as a tested-together set.
+# torch is installed per-OS in the workflow (NOT here):
+#  - Windows: torch==2.3.1 CPU wheel + torch-directml
+#    (torch-directml supports up to torch 2.3.1 - Microsoft docs)
+#  - macOS: torch==2.4.1 (MPS on Apple Silicon)
+# Pinning rationale: unpinned huggingface_hub>=0.26 removed `cached_download`,
+# which broke `from diffusers import StableDiffusionImg2ImgPipeline`
+# ("cannot import name ..."). This set is verified to import cleanly together.
 PySide6
 numpy
 Pillow
 diffusers==0.31.0
-transformers
-tokenizers
-huggingface_hub
-safetensors
+transformers==4.44.2
+tokenizers==0.19.1
+huggingface_hub==0.25.2
+safetensors==0.4.5
+accelerate==0.34.2
 requests
 urllib3
 certifi
 tqdm
+packaging
+filelock
+fsspec
+regex
 rembg
 onnxruntime
 pyinstaller
