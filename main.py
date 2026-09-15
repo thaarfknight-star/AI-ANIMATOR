@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
-"""AI Animator — demo desktop app (PySide6).
+"""AI Animator - desktop app (PySide6).
 
-User loads a photo -> picks a scenario (working / waiting / create-image)
--> live preview -> export transparent GIF.
+Two engines:
+  * Procedural (built-in, instant): code-drawn animation from the photo.
+  * AI (on-device): 3-stage pipeline - avatar generation -> pose keyframes
+    -> background removal. Needs the full build (torch bundled) and downloads
+    the diffusion model once on first use. Falls back to procedural on error.
 """
 import os
 import sys
+import traceback
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QRadioButton,
     QVBoxLayout, QHBoxLayout, QFileDialog, QButtonGroup, QFrame, QSizePolicy,
+    QProgressBar,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap
 
 from PIL import Image
 
 from character import load_photo, make_sprite, make_painting
-from scenarios import render_all, SCENARIO_NAMES_FA, FPS
+from scenarios import render_all, render_keyframed, SCENARIO_NAMES_FA, FPS
 from exporter import export_gif
 
 
@@ -29,12 +34,36 @@ def resource_path(rel):
 ORDER = ["working", "waiting", "create"]
 
 
+class AIWorker(QThread):
+    progress = Signal(str, int)   # stage_fa, percent
+    log = Signal(str)
+    done = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, photo):
+        super().__init__()
+        self.photo = photo
+
+    def run(self):
+        try:
+            from ai_engine import AIEngine
+            engine = AIEngine(
+                progress_cb=lambda s, p: self.progress.emit(s, p),
+                log_cb=lambda t: self.log.emit(t),
+            )
+            result = engine.build_character(self.photo)
+            self.done.emit(result)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            self.failed.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("استودیو انیمیشن AI — دمو")
+        self.setWindowTitle("استودیو انیمیشن AI")
         self.setLayoutDirection(Qt.RightToLeft)
-        self.resize(900, 640)
+        self.resize(920, 660)
 
         self.photo = None
         self.sprite = None
@@ -42,6 +71,9 @@ class MainWindow(QMainWindow):
         self.frames = []
         self.frame_idx = 0
         self.scenario = "working"
+        self.ai_character = None   # dict from AIEngine.build_character
+        self.ai_mode = False
+        self.worker = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -61,10 +93,10 @@ class MainWindow(QMainWindow):
         panel = QFrame()
         panel.setStyleSheet("QFrame { background:#1c1c26; border-radius:12px; }")
         lay = QVBoxLayout(panel)
-        lay.setSpacing(12)
+        lay.setSpacing(10)
         lay.setContentsMargins(18, 18, 18, 18)
 
-        title = QLabel("🎬 استودیو انیمیشن")
+        title = QLabel("🎬 استودیو انیمیشن AI")
         title.setStyleSheet("font-size:20px; font-weight:bold; color:#fff;")
         lay.addWidget(title)
 
@@ -76,6 +108,25 @@ class MainWindow(QMainWindow):
         self.lbl_photo.setStyleSheet("color:#999; font-size:12px;")
         self.lbl_photo.setWordWrap(True)
         lay.addWidget(self.lbl_photo)
+
+        self.btn_ai = QPushButton("🤖 ساخت آواتار با AI")
+        self.btn_ai.clicked.connect(self.start_ai)
+        lay.addWidget(self.btn_ai)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setStyleSheet(
+            "QProgressBar { background:#101018; border-radius:6px; color:#ddd; }"
+            "QProgressBar::chunk { background:#0f7cc1; border-radius:6px; }")
+        self.progress.hide()
+        lay.addWidget(self.progress)
+
+        self.lbl_stage = QLabel("")
+        self.lbl_stage.setStyleSheet("color:#9db4d0; font-size:12px;")
+        self.lbl_stage.setWordWrap(True)
+        lay.addWidget(self.lbl_stage)
 
         lay.addWidget(QLabel("سناریو:"))
         self.group = QButtonGroup(self)
@@ -109,15 +160,18 @@ class MainWindow(QMainWindow):
             b.setStyleSheet(
                 "QPushButton { background:#0f7cc1; color:#fff; border-radius:8px;"
                 " padding:10px; font-size:14px; }"
-                "QPushButton:hover { background:#1493e0; }"
-            )
+                "QPushButton:hover { background:#1493e0; }")
+        self.btn_ai.setStyleSheet(
+            "QPushButton { background:#7b2fbe; color:#fff; border-radius:8px;"
+            " padding:10px; font-size:14px; }"
+            "QPushButton:hover { background:#9440dd; }"
+            "QPushButton:disabled { background:#4a4a55; color:#999; }")
 
         # ---- playback timer ----
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.next_frame)
         self.timer.start(int(1000 / FPS))
 
-        # default sample image so the demo runs out of the box
         self.load_image(resource_path(os.path.join("assets", "sample.png")),
                         label="عکس نمونه فعال است")
 
@@ -127,6 +181,8 @@ class MainWindow(QMainWindow):
             self, "انتخاب عکس", "",
             "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
         if path:
+            self.ai_character = None
+            self.ai_mode = False
             self.load_image(path, label=os.path.basename(path))
 
     def load_image(self, path, label=""):
@@ -146,14 +202,68 @@ class MainWindow(QMainWindow):
         self.scenario = key
         self.render()
 
+    # ------------------------------------------------------------ AI --
+    def start_ai(self):
+        if self.photo is None or self.worker is not None:
+            return
+        try:
+            from ai_engine import pick_device  # noqa
+        except Exception as e:  # noqa: BLE001
+            self.status.setText(f"موتور AI در دسترس نیست: {e}")
+            return
+        self.btn_ai.setEnabled(False)
+        self.progress.show()
+        self.progress.setValue(0)
+        self.lbl_stage.setText("در حال شروع...")
+        self.status.setText("AI در حال کار است، لطفاً صبر کنید...")
+        self.worker = AIWorker(self.photo.copy())
+        self.worker.progress.connect(self.on_ai_progress)
+        self.worker.log.connect(self.on_ai_log)
+        self.worker.done.connect(self.on_ai_done)
+        self.worker.failed.connect(self.on_ai_failed)
+        self.worker.start()
+
+    def on_ai_progress(self, stage, pct):
+        self.lbl_stage.setText(stage)
+        self.progress.setValue(max(0, min(100, pct)))
+
+    def on_ai_log(self, text):
+        self.status.setText(text)
+
+    def on_ai_done(self, result):
+        self.worker = None
+        self.ai_character = result
+        self.ai_mode = True
+        self.btn_ai.setEnabled(True)
+        self.progress.hide()
+        self.lbl_stage.setText("")
+        self.status.setText("آواتار AI آماده شد ✅")
+        self.render()
+
+    def on_ai_failed(self, err):
+        self.worker = None
+        self.btn_ai.setEnabled(True)
+        self.progress.hide()
+        self.lbl_stage.setText("")
+        self.status.setText(f"AI ناموفق بود، حالت نمایشی فعال است:\n{err[:160]}")
+
+    # ------------------------------------------------------------ render --
     def render(self):
         if self.sprite is None:
             return
         self.status.setText("در حال ساخت انیمیشن...")
         QApplication.processEvents()
-        self.frames = render_all(self.sprite, self.painting, self.scenario)
+        if self.ai_mode and self.ai_character:
+            kfs = self.ai_character["keyframes"].get(self.scenario)
+            if kfs:
+                self.frames = render_keyframed(kfs)
+            else:
+                self.frames = render_all(self.sprite, self.painting, self.scenario)
+        else:
+            self.frames = render_all(self.sprite, self.painting, self.scenario)
         self.frame_idx = 0
-        self.status.setText("آماده ✅")
+        mode = "AI 🤖" if self.ai_mode else "نمایشی"
+        self.status.setText(f"آماده ✅ (حالت {mode})")
 
     def next_frame(self):
         if not self.frames:
@@ -171,8 +281,7 @@ class MainWindow(QMainWindow):
             self.status.setText("اول انیمیشن را بسازید")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "ذخیره گیف", f"anim_{self.scenario}.gif",
-            "GIF (*.gif)")
+            self, "ذخیره گیف", f"anim_{self.scenario}.gif", "GIF (*.gif)")
         if not path:
             return
         self.status.setText("در حال ذخیره...")

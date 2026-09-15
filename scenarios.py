@@ -239,6 +239,40 @@ def frame_create(sprite, painting, i):
 
 
 # --------------------------------------------------------------- dispatcher --
+def render_keyframed(keyframes, n_frames=N_FRAMES):
+    """Tween AI keyframes into a smooth loop (cosine cross-dissolve chain).
+
+    keyframes: list of RGBA PIL images (2+). Returns n_frames RGBA frames.
+    This is the 'optimized' animation path: AI draws the poses, code draws
+    the motion - about 10x lighter than video-diffusion.
+    """
+    import math as _math
+    k = len(keyframes)
+    if k == 0:
+        raise ValueError("no keyframes")
+    if k == 1:
+        keyframes = keyframes * 2
+        k = 2
+    seq = [kf.convert("RGBA").resize((CANVAS, CANVAS)) for kf in keyframes]
+    frames = []
+    per = n_frames / k  # frames spent blending kf[i] -> kf[i+1]
+    for i in range(n_frames):
+        pos = (i / per) % k
+        a = int(pos)
+        b = (a + 1) % k
+        f = pos - a
+        w = 0.5 - 0.5 * _math.cos(f * _math.pi)  # smoothstep-ish
+        frame = Image.blend(seq[a], seq[b], w)
+        # gentle "breathing" so even holds feel alive
+        s = 1.0 + 0.012 * _math.sin(i / n_frames * 2 * _math.pi)
+        nw = int(CANVAS * s)
+        z = frame.resize((nw, nw), Image.LANCZOS)
+        out = new_canvas()
+        out.alpha_composite(z, ((CANVAS - nw) // 2, (CANVAS - nw) // 2))
+        frames.append(out)
+    return frames
+
+
 RENDERERS = {
     "working": lambda sprite, painting, i: frame_working(sprite, i),
     "waiting": lambda sprite, painting, i: frame_waiting(sprite, i),

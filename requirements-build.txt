@@ -1,0 +1,12 @@
+# Full build requirements (CI). torch is installed per-OS in the workflow:
+#  - Windows: CPU wheel + torch-directml (AMD/Intel GPUs via DirectML)
+#  - macOS: default wheel (MPS on Apple Silicon)
+PySide6
+numpy
+Pillow
+diffusers==0.31.0
+huggingface_hub
+safetensors
+rembg
+onnxruntime
+pyinstaller
