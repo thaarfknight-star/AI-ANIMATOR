@@ -34,15 +34,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
-      - name: Install torch (Windows CPU + DirectML for AMD/Intel GPUs)
+      - name: Install torch (Windows: torch 2.4.1 CPU + DirectML for AMD/Intel GPUs)
         if: matrix.os == 'windows-latest'
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install torch-directml
+          pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install torch-directml==0.2.5.dev240914
 
-      - name: Install torch (macOS, MPS on Apple Silicon)
+      - name: Install torch (macOS: torch 2.4.1, MPS on Apple Silicon)
         if: matrix.os == 'macos-latest'
-        run: pip install torch
+        run: pip install torch==2.4.1
+
+      - name: Smoke-test AI imports (fail fast here, not on the user's PC)
+        run: |
+          python -c "from diffusers import StableDiffusionImg2ImgPipeline; print('diffusers import OK')"
+          python -c "import transformers, huggingface_hub, torch; print('ai stack OK', torch.__version__)"
 
       - name: Build with PyInstaller
         run: pyinstaller build.spec
