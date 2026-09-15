@@ -1,11 +1,13 @@
 # Full build requirements (CI) - versions pinned as a tested-together set.
 # torch is installed per-OS in the workflow (NOT here):
-#  - Windows: torch==2.3.1 CPU wheel + torch-directml
-#    (torch-directml supports up to torch 2.3.1 - Microsoft docs)
+#  - Windows: torch==2.4.1 CPU wheel + torch-directml==0.2.5.dev240914
+#    (torch-directml requires torch==2.4.1 / torchvision==0.19.1)
 #  - macOS: torch==2.4.1 (MPS on Apple Silicon)
 # Pinning rationale: unpinned huggingface_hub>=0.26 removed `cached_download`,
 # which broke `from diffusers import StableDiffusionImg2ImgPipeline`
 # ("cannot import name ..."). This set is verified to import cleanly together.
+# Also: unpinned `pip install torch-directml` silently UPGRADED torch 2.3.1 ->
+# 2.4.1 to satisfy its own requirement; both are now pinned to the same combo.
 PySide6
 numpy
 Pillow
@@ -25,4 +27,5 @@ fsspec
 regex
 rembg
 onnxruntime
+scipy
 pyinstaller

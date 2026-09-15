@@ -149,7 +149,12 @@ def check_engine():
         return out
     try:
         import torch_directml  # noqa: F401
-        out.append(("torch-directml", True, _ver(sys.modules["torch_directml"])))
+        try:
+            from importlib.metadata import version as _pkg_version
+            _dml_ver = _pkg_version("torch-directml")
+        except Exception:
+            _dml_ver = _ver(sys.modules["torch_directml"])
+        out.append(("torch-directml", True, _dml_ver))
     except Exception:  # noqa: BLE001
         out.append(("torch-directml", False, "موجود نیست (فقط ویندوز/اختیاری)"))
     try:
@@ -204,6 +209,46 @@ class AIEngine:
         except Exception:
             pass
 
+    def _from_pretrained_with_fallback(self, dtype):
+        """بارگذاری مدل با تلاش دوباره از آینه‌ی hf-mirror.com.
+
+        در بعضی شبکه‌ها (از جمله ایران) API سایت huggingface.co جواب
+        می‌دهد ولی CDN دانلود فایل (us.aws.cdn.hf.co) مسدود است و دانلود
+        با MaxRetryError می‌افتد. در این حالت یک بار دیگر از آینه تلاش
+        می‌کنیم وگرنه خطای فارسی و واضح بالا می‌بریم.
+        """
+        import os
+        from diffusers import StableDiffusionImg2ImgPipeline
+
+        last_err = None
+        for endpoint in (None, "https://hf-mirror.com"):
+            if endpoint:
+                os.environ["HF_ENDPOINT"] = endpoint
+                try:
+                    import huggingface_hub.constants as _c
+                    _c.HF_ENDPOINT = endpoint
+                except Exception:
+                    pass
+                self.log_cb("سرور اصلی جواب نداد؛ تلاش دوباره با آینه‌ی "
+                            "hf-mirror.com ...")
+            try:
+                return StableDiffusionImg2ImgPipeline.from_pretrained(
+                    MODEL_ID,
+                    torch_dtype=dtype,
+                    cache_dir=app_data_dir(),
+                    safety_checker=None,
+                )
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                where = "سرور اصلی" if endpoint is None else "آینه"
+                self.log_cb(f"❌ دانلود از {where} ناموفق بود: "
+                            f"{str(e)[:220]}")
+        raise RuntimeError(
+            "دانلود مدل ناموفق بود. اینترنت را بررسی کنید؛ اگر CDN سایت "
+            "HuggingFace در شبکه‌ی شما مسدود است، با VPN یک بار مدل را "
+            "دانلود کنید (فقط بار اول لازم است). "
+            f"جزئیات: {str(last_err)[:300]}")
+
     def _pipe_get(self):
         with self._pipe_lock:
             if self._pipe is not None:
@@ -222,12 +267,7 @@ class AIEngine:
             use_fp16 = kind in ("cuda", "mps")
             dtype = torch.float16 if use_fp16 else torch.float32
             self.log_cb(f"دانلود/بارگذاری مدل {MODEL_ID} ... (فقط بار اول)")
-            pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-                MODEL_ID,
-                torch_dtype=dtype,
-                cache_dir=app_data_dir(),
-                safety_checker=None,
-            )
+            pipe = self._from_pretrained_with_fallback(dtype)
             if kind == "cuda":
                 pipe = pipe.to("cuda")
             elif kind == "mps":

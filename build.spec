@@ -12,9 +12,9 @@ binaries = []
 hiddenimports = []
 
 # Collect full package content (code + data files) for the whole AI stack.
-for pkg in ("torch", "diffusers", "transformers", "tokenizers",
+for pkg in ("torch", "torchvision", "diffusers", "transformers", "tokenizers",
             "huggingface_hub", "safetensors", "accelerate", "rembg",
-            "onnxruntime",
+            "onnxruntime", "scipy",
             "PIL", "numpy", "requests", "urllib3", "certifi",
             "charset_normalizer", "idna", "tqdm", "packaging",
             "filelock", "fsspec", "regex"):
@@ -32,7 +32,8 @@ for pkg in ("torch", "diffusers", "transformers", "tokenizers",
 for pkg in ("requests", "urllib3", "certifi", "transformers", "tokenizers",
             "diffusers", "huggingface_hub", "safetensors", "accelerate",
             "filelock", "fsspec", "tqdm", "packaging", "regex", "numpy",
-            "Pillow", "torch", "onnxruntime", "rembg"):
+            "Pillow", "torch", "torchvision", "torch_directml",
+            "onnxruntime", "rembg", "scipy"):
     try:
         datas += copy_metadata(pkg)
     except Exception:
@@ -55,7 +56,9 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["matplotlib", "scipy", "pandas", "notebook", "jupyter"],
+    # scipy لازم است: موتور حذف پس‌زمینه‌ی rembg بدون آن بالا نمی‌آید
+    # (خطای No module named 'scipy' روی نسخه‌ی قبلی).
+    excludes=["matplotlib", "pandas", "notebook", "jupyter"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
